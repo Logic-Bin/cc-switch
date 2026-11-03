@@ -3,7 +3,11 @@ use crate::error::AppError;
 use crate::provider::{Provider, ProviderMeta};
 use indexmap::IndexMap;
 use rusqlite::{params, OptionalExtension};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+#[cfg(test)]
+#[path = "providers_tests.rs"]
+mod tests;
 
 type OmoProviderRow = (
     String,
@@ -108,7 +112,7 @@ impl Database {
         app_type: &str,
     ) -> Result<IndexMap<String, Provider>, AppError> {
         let conn = lock_conn!(self.conn);
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT id, name, settings_config, website_url, category, created_at, sort_index, notes, icon, icon_color, meta, in_failover_queue
              FROM providers WHERE app_type = ?1
              ORDER BY COALESCE(sort_index, 999999), created_at ASC, id ASC"
@@ -157,38 +161,47 @@ impl Database {
         for provider_res in provider_iter {
             let (id, mut provider) = provider_res.map_err(|e| AppError::Database(e.to_string()))?;
             provider.id = id.clone();
-
-            let mut stmt_endpoints = conn.prepare(
-                "SELECT url, added_at FROM provider_endpoints WHERE provider_id = ?1 AND app_type = ?2 ORDER BY added_at ASC, url ASC"
-            ).map_err(|e| AppError::Database(e.to_string()))?;
-
-            let endpoints_iter = stmt_endpoints
-                .query_map(params![id, app_type], |row| {
-                    let url: String = row.get(0)?;
-                    let added_at: Option<i64> = row.get(1)?;
-                    Ok((
-                        url,
-                        crate::settings::CustomEndpoint {
-                            url: "".to_string(),
-                            added_at: added_at.unwrap_or(0),
-                            last_used: None,
-                        },
-                    ))
-                })
-                .map_err(|e| AppError::Database(e.to_string()))?;
-
-            let mut custom_endpoints = HashMap::new();
-            for ep_res in endpoints_iter {
-                let (url, mut ep) = ep_res.map_err(|e| AppError::Database(e.to_string()))?;
-                ep.url = url.clone();
-                custom_endpoints.insert(url, ep);
-            }
-
             if let Some(meta) = &mut provider.meta {
-                meta.custom_endpoints = custom_endpoints;
+                // The endpoint table is authoritative, including when it is empty.
+                meta.custom_endpoints.clear();
             }
-
             providers.insert(id, provider);
+        }
+
+        if providers.is_empty() {
+            return Ok(providers);
+        }
+
+        // Read endpoints once for the whole app instead of preparing/scanning the
+        // table for every provider. Keep the same per-provider ordering so legacy
+        // duplicate URLs still resolve to the most recently added entry.
+        let mut endpoints = conn
+            .prepare_cached(
+                "SELECT provider_id, url, added_at FROM provider_endpoints
+                 WHERE app_type = ?1 ORDER BY provider_id, added_at ASC, url ASC",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let rows = endpoints
+            .query_map(params![app_type], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                ))
+            })
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        for row in rows {
+            let (id, url, added_at) = row.map_err(|e| AppError::Database(e.to_string()))?;
+            if let Some(meta) = providers.get_mut(&id).and_then(|p| p.meta.as_mut()) {
+                meta.custom_endpoints.insert(
+                    url.clone(),
+                    crate::settings::CustomEndpoint {
+                        url,
+                        added_at,
+                        last_used: None,
+                    },
+                );
+            }
         }
 
         Ok(providers)
@@ -306,6 +319,8 @@ impl Database {
             existing.unwrap_or((false, provider.in_failover_queue));
 
         if is_update {
+            // Native-provider list refreshes also pass through this method. An
+            // unchanged row must not dirty the database or enqueue cloud sync.
             tx.execute(
                 "UPDATE providers SET
                     name = ?1,
@@ -320,7 +335,13 @@ impl Database {
                     meta = ?10,
                     is_current = ?11,
                     in_failover_queue = ?12
-                WHERE id = ?13 AND app_type = ?14",
+                WHERE id = ?13 AND app_type = ?14
+                  AND (name IS NOT ?1 OR settings_config IS NOT ?2
+                       OR website_url IS NOT ?3 OR category IS NOT ?4
+                       OR created_at IS NOT ?5 OR sort_index IS NOT ?6
+                       OR notes IS NOT ?7 OR icon IS NOT ?8 OR icon_color IS NOT ?9
+                       OR meta IS NOT ?10 OR is_current IS NOT ?11
+                       OR in_failover_queue IS NOT ?12)",
                 params![
                     provider.name,
                     serde_json::to_string(&provider.settings_config).map_err(|e| {
